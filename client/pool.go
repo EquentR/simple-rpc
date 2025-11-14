@@ -3,26 +3,33 @@ package client
 import (
 	"crypto/tls"
 	"errors"
-	"github.com/EquentR/simple-rpc/conn"
-	"github.com/EquentR/simple-rpc/logger"
-	"github.com/EquentR/simple-rpc/protocol"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/EquentR/simple-rpc/conn"
+	"github.com/EquentR/simple-rpc/logger"
+	"github.com/EquentR/simple-rpc/protocol"
 )
 
 // ClientPool 管理连接池中的多个TCP连接
 type ClientPool struct {
 	Addr        string        // 服务器地址
 	TLSConfig   *tls.Config   // TLS配置
-	Size        int           // 连接池大小
+	Size        int           // 连接池目标大小
 	conns       []*Conn       // 连接数组
 	idx         atomic.Uint32 // 负载均衡的轮询索引
 	rid         atomic.Uint64 // 请求ID生成器
 	mu          sync.RWMutex  // 读写锁保护连接池操作
 	DialTimeout time.Duration // 连接超时时间
 	connIDGen   atomic.Uint64 // 连接ID生成器
+
+	// 连接池管理相关
+	cleanupInterval time.Duration // 清理间隔
+	targetSize      atomic.Int32  // 目标大小
+	cleanupRunning  atomic.Bool   // 清理任务运行标志
+	stopCleanup     chan struct{} // 停止清理任务信号
 }
 
 // Conn 包装客户端连接
@@ -34,18 +41,35 @@ type Conn struct {
 	resp sync.Map         // 响应通道映射表
 	dead atomic.Bool      // 连接死亡标志
 	p    *ClientPool      // 父连接池
+
+	// 连接使用状态跟踪
+	refCount atomic.Int32 // 引用计数
+	lastUsed atomic.Int64 // 最后使用时间戳
+	inUse    atomic.Bool  // 是否正在使用
 }
 
 // New 创建新的客户端连接池
 func New(addr string, cfg *tls.Config, size int) *ClientPool {
 	logger.Info("Creating client connection pool, address: %s, size: %d", addr, size)
-	p := &ClientPool{Addr: addr, TLSConfig: cfg, Size: size, DialTimeout: 3 * time.Second}
+	p := &ClientPool{
+		Addr:            addr,
+		TLSConfig:       cfg,
+		Size:            size,
+		DialTimeout:     3 * time.Second,
+		cleanupInterval: 30 * time.Second, // 默认30秒清理一次
+		stopCleanup:     make(chan struct{}),
+	}
+	p.targetSize.Store(int32(size))
 	p.conns = make([]*Conn, size)
 	for i := 0; i < size; i++ {
 		connID := p.connIDGen.Add(1)
 		p.conns[i] = &Conn{id: connID, addr: addr, cfg: cfg, p: p}
 		logger.Debug("Creating connection object, connection ID: %d, index: %d", connID, i)
 	}
+
+	// 启动清理任务
+	go p.cleanupTask()
+
 	return p
 }
 
@@ -84,8 +108,11 @@ func (cc *Conn) read() {
 	for {
 		f, err := cc.cn.ReadOne()
 		if err != nil {
-			logger.Error("Connection ID: %d read data failed: %v", cc.id, err)
-			cc.dead.Store(true)
+			if !cc.IsDead() {
+				logger.Error("Connection ID: %d read data failed: %v", cc.id, err)
+				cc.dead.Store(true)
+				cc.cn.Close()
+			}
 			return
 		}
 
@@ -120,12 +147,66 @@ func (cc *Conn) write(f *protocol.Frame) error {
 
 	err := cc.cn.WriteFrame(f)
 	if err != nil {
-		logger.Error("Connection ID: %d failed to send data frame: %v", cc.id, err)
-		cc.dead.Store(true)
+		if !cc.IsDead() {
+			logger.Error("Connection ID: %d failed to send data frame: %v", cc.id, err)
+			cc.dead.Store(true)
+			cc.cn.Close()
+		}
 	} else {
 		logger.Debug("Connection ID: %d successfully sent data frame, request ID: %d", cc.id, f.ID)
 	}
 	return err
+}
+
+func (cc *Conn) IsDead() bool {
+	return cc.dead.Load()
+}
+
+// acquire 获取连接引用
+func (cc *Conn) acquire() bool {
+	if cc.dead.Load() {
+		return false
+	}
+
+	// 原子递增引用计数
+	refCount := cc.refCount.Add(1)
+	if refCount == 1 {
+		cc.inUse.Store(true)
+		cc.lastUsed.Store(time.Now().Unix())
+	}
+
+	logger.Debug("Connection ID: %d acquired, refCount: %d", cc.id, refCount)
+	return true
+}
+
+// release 释放连接引用
+func (cc *Conn) release() {
+	refCount := cc.refCount.Add(-1)
+	if refCount == 0 {
+		cc.inUse.Store(false)
+		cc.lastUsed.Store(time.Now().Unix())
+	}
+
+	logger.Debug("Connection ID: %d released, refCount: %d", cc.id, refCount)
+}
+
+// canClose 检查连接是否可以被关闭
+func (cc *Conn) canClose() bool {
+	if cc.inUse.Load() {
+		return false // 正在使用
+	}
+
+	if cc.refCount.Load() > 0 {
+		return false // 还有引用
+	}
+
+	// 检查是否空闲超过一定时间（例如5分钟）
+	lastUsed := cc.lastUsed.Load()
+	if lastUsed > 0 && time.Now().Unix()-lastUsed < 300 {
+		return false // 最近使用过
+	}
+
+	return true
 }
 
 // next 从连接池获取下一个可用连接（轮询算法）
@@ -134,12 +215,14 @@ func (cc *Conn) write(f *protocol.Frame) error {
 // 1. 使用原子操作递增轮询索引，实现简单的负载均衡
 // 2. 检查获取的连接是否有效（非空、未死亡、底层连接未关闭）
 // 3. 如果连接无效，在写锁保护下重新创建连接对象
-// 4. 返回可用连接
+// 4. 获取连接引用，确保使用期间不会被关闭
+// 5. 返回可用连接
 //
 // 注意事项：
 // - 使用读写锁提高并发性能
 // - 无效连接自动重新创建，无需手动处理
 // - 返回nil表示连接池为空
+// - 调用者需要在使用完毕后调用release方法释放引用
 func (p *ClientPool) next() *Conn {
 	logger.Debug("Starting to get next available connection from pool")
 
@@ -175,6 +258,12 @@ func (p *ClientPool) next() *Conn {
 		p.mu.Unlock()
 	}
 
+	// 获取连接引用
+	if !cc.acquire() {
+		logger.Warn("Connection ID: %d failed to acquire reference", cc.id)
+		return nil
+	}
+
 	logger.Debug("Successfully obtained connection, connection ID: %d", cc.id)
 	return cc
 }
@@ -199,6 +288,9 @@ func (p *ClientPool) Call(route string, payload []byte, timeout time.Duration) (
 		return nil, errors.New("no connection")
 	}
 
+	// 确保释放引用
+	defer cc.release()
+
 	logger.Debug("Using connection ID: %d for call", cc.GetConnID())
 
 	// 创建响应通道
@@ -211,8 +303,10 @@ func (p *ClientPool) Call(route string, payload []byte, timeout time.Duration) (
 
 	// 发送请求
 	if err := cc.write(f); err != nil {
-		logger.Error("Failed to send request: %v", err)
-		cc.resp.Delete(id)
+		if !cc.IsDead() {
+			logger.Error("Failed to send request: %v", err)
+			cc.resp.Delete(id)
+		}
 		return nil, err
 	}
 
@@ -268,6 +362,7 @@ func (p *ClientPool) CallStream(route string, payload []byte, timeout time.Durat
 		logger.Error("Streaming call failed to send request: %v", err)
 		cc.resp.Delete(id)
 		close(out)
+		cc.release() // 释放引用
 		return nil, err
 	}
 
@@ -277,6 +372,7 @@ func (p *ClientPool) CallStream(route string, payload []byte, timeout time.Durat
 		logger.Debug("Starting streaming response processing goroutine, request ID: %d", id)
 		defer func() {
 			close(out)
+			cc.release() // 释放引用
 			logger.Debug("Streaming response processing goroutine ended, request ID: %d", id)
 		}()
 
@@ -309,7 +405,12 @@ func (p *ClientPool) CallStream(route string, payload []byte, timeout time.Durat
 	return out, nil
 }
 
-// SetSize 动态调整连接池大小
+// SetSize 动态调整连接池大小（安全版本）
+//
+// 重要改进：
+// - 不会立即关闭正在使用的连接
+// - 通过目标大小和清理任务逐步调整
+// - 只在连接空闲且满足清理条件时才关闭
 func (p *ClientPool) SetSize(size int) {
 	if size < 0 {
 		logger.Warn("Attempting to set invalid connection pool size: %d", size)
@@ -318,33 +419,32 @@ func (p *ClientPool) SetSize(size int) {
 
 	logger.Info("Adjusting connection pool size, target size: %d", size)
 
+	// 更新目标大小
+	oldTarget := p.targetSize.Load()
+	p.targetSize.Store(int32(size))
+
+	// 立即处理扩容情况
+	if size > int(oldTarget) {
+		p.expandPool(size)
+	} else {
+		// 缩容情况：只更新目标大小，由清理任务处理
+		logger.Info("Shrink request registered, will be processed by cleanup task, current target: %d", size)
+	}
+}
+
+// expandPool 立即扩展连接池
+func (p *ClientPool) expandPool(targetSize int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	cur := len(p.conns)
-	if size == cur {
-		logger.Debug("Connection pool size no adjustment needed, current size: %d", cur)
+	if targetSize <= cur {
+		logger.Debug("No expansion needed, current size: %d, target: %d", cur, targetSize)
 		return
 	}
 
-	if size < cur {
-		logger.Info("Shrinking connection pool from %d to %d", cur, size)
-		// 关闭多余的连接
-		for i := size; i < cur; i++ {
-			if p.conns[i] != nil && p.conns[i].cn != nil {
-				logger.Debug("Closing connection at pool index %d", i)
-				p.conns[i].cn.Close()
-			}
-		}
-		p.conns = p.conns[:size]
-		p.Size = size
-		logger.Info("Connection pool shrink completed")
-		return
-	}
-
-	// 扩展连接池
-	addCount := size - cur
-	logger.Info("Expanding connection pool from %d to %d, adding %d connections", cur, size, addCount)
+	addCount := targetSize - cur
+	logger.Info("Expanding connection pool from %d to %d, adding %d connections", cur, targetSize, addCount)
 
 	add := make([]*Conn, addCount)
 	for i := 0; i < len(add); i++ {
@@ -353,13 +453,90 @@ func (p *ClientPool) SetSize(size int) {
 		logger.Debug("Creating new connection, connection ID: %d", connID)
 	}
 	p.conns = append(p.conns, add...)
-	p.Size = size
+	p.Size = targetSize
 	logger.Info("Connection pool expansion completed")
+}
+
+// cleanupTask 定时清理任务
+//
+// 工作流程：
+// 1. 定期检查当前连接池大小与目标大小的差异
+// 2. 如果当前大小超过目标大小，尝试清理空闲连接
+// 3. 只清理满足canClose条件的连接
+// 4. 使用指数退避避免频繁清理
+func (p *ClientPool) cleanupTask() {
+	if p.cleanupRunning.Swap(true) {
+		logger.Warn("Cleanup task already running")
+		return
+	}
+	defer p.cleanupRunning.Store(false)
+
+	logger.Info("Starting connection pool cleanup task, interval: %v", p.cleanupInterval)
+	ticker := time.NewTicker(p.cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.performCleanup()
+		case <-p.stopCleanup:
+			logger.Info("Cleanup task stopped")
+			return
+		}
+	}
+}
+
+// performCleanup 执行清理操作
+func (p *ClientPool) performCleanup() {
+	targetSize := int(p.targetSize.Load())
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	currentSize := len(p.conns)
+	if currentSize <= targetSize {
+		logger.Debug("No cleanup needed, current size: %d, target: %d", currentSize, targetSize)
+		return
+	}
+
+	// 需要清理的连接数量
+	needCleanup := currentSize - targetSize
+	logger.Info("Starting cleanup, need to remove %d connections", needCleanup)
+
+	cleanupCount := 0
+	newConns := make([]*Conn, 0, targetSize)
+
+	for _, cc := range p.conns {
+		if cleanupCount < needCleanup && cc.canClose() {
+			// 可以清理这个连接
+			logger.Debug("Closing idle connection ID: %d", cc.id)
+			cc.dead.Store(true)
+			if cc.cn != nil {
+				cc.cn.Close()
+			}
+			cleanupCount++
+		} else {
+			// 保留这个连接
+			newConns = append(newConns, cc)
+		}
+	}
+
+	p.conns = newConns
+	p.Size = len(newConns)
+
+	if cleanupCount > 0 {
+		logger.Info("Cleanup completed, removed %d connections, current size: %d", cleanupCount, p.Size)
+	} else {
+		logger.Debug("No connections were eligible for cleanup")
+	}
 }
 
 // Close 关闭连接池并释放所有连接资源
 func (p *ClientPool) Close() {
 	logger.Info("Starting to close connection pool, address: %s", p.Addr)
+
+	// 停止清理任务
+	close(p.stopCleanup)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -368,9 +545,20 @@ func (p *ClientPool) Close() {
 	for i, cc := range p.conns {
 		if cc != nil && cc.cn != nil {
 			logger.Debug("Closing connection at pool index %d, connection ID: %d", i, cc.id)
+			cc.dead.Store(true)
 			cc.cn.Close()
 		}
 	}
 
 	logger.Info("Connection pool close completed")
+}
+
+// SetCleanupInterval 设置清理间隔
+func (p *ClientPool) SetCleanupInterval(interval time.Duration) {
+	if interval <= 0 {
+		logger.Warn("Invalid cleanup interval: %v", interval)
+		return
+	}
+	p.cleanupInterval = interval
+	logger.Info("Cleanup interval updated: %v", interval)
 }

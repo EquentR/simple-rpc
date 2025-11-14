@@ -22,11 +22,14 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		wgg := sync.WaitGroup{}
 		logger.Info("Starting connection pool simulation - dynamic size adjustment")
 
 		// 使用小连接池的初始请求
 		for i := 0; i < 3; i++ {
+			wgg.Add(1)
 			go func(iteration int) {
+				defer wgg.Done()
 				logger.Info("Request iteration %d with initial pool size", iteration)
 				performRequestResponse(pool, iteration)
 			}(i)
@@ -40,7 +43,9 @@ func main() {
 
 		// 使用扩展后的连接池进行更多请求
 		for i := 3; i < 6; i++ {
+			wgg.Add(1)
 			go func(iteration int) {
+				defer wgg.Done()
 				logger.Info("Request iteration %d with expanded pool size", iteration)
 				performRequestResponse(pool, iteration)
 			}(i)
@@ -54,11 +59,14 @@ func main() {
 
 		// 使用缩减后的连接池进行最终请求
 		for i := 6; i < 10; i++ {
+			wgg.Add(1)
 			go func(iteration int) {
+				defer wgg.Done()
 				logger.Info("Request iteration %d with shrunk pool size", iteration)
 				performRequestResponse(pool, iteration)
 			}(i)
 		}
+		wgg.Wait()
 	}()
 
 	// 双向流式示例
@@ -74,14 +82,18 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		wgg := sync.WaitGroup{}
 		time.Sleep(3 * time.Second)
 		logger.Info("Starting multiple concurrent streaming sessions")
 		for sessionID := 0; sessionID < 3; sessionID++ {
+			wgg.Add(1)
 			go func(sid int) {
+				defer wgg.Done()
 				logger.Info("Starting concurrent streaming session %d", sid)
 				performClientStreaming(pool, sid)
 			}(sessionID)
 		}
+		wgg.Wait()
 	}()
 
 	wg.Wait()
