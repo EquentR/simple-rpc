@@ -3,183 +3,211 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
-	"github.com/EquentR/simple-rpc/client"
-	"github.com/EquentR/simple-rpc/logger"
 	"sync"
 	"time"
+
+	"github.com/EquentR/simple-rpc/client"
+	"github.com/EquentR/simple-rpc/logger"
+)
+
+// 定义路由常量（与服务端保持一致）
+const (
+	RouteHealth     = "/health"
+	RouteEcho       = "/echo"
+	RouteStreamTime = "/stream/time"
 )
 
 func main() {
-	logger.Info("Starting complex TCP client example with bidirectional streaming and connection pool simulation")
+	logger.Info("Starting best practice RPC client example")
 
+	// 创建TLS配置（跳过证书验证用于测试）
 	cfg := &tls.Config{InsecureSkipVerify: true}
-	pool := client.New("127.0.0.1:8443", cfg, 5)
+
+	// 创建客户端连接池
+	pool := client.New("127.0.0.1:8446", cfg, 3)
 	defer pool.Close()
 
+	logger.Info("Client connected to server at 127.0.0.1:8446")
+	logger.Info("Connection pool size: 3")
+
+	// 使用WaitGroup协调并发操作
 	var wg sync.WaitGroup
 
-	// 模拟连接池增长和回收
+	// 测试1: 健康检查（请求-响应模式）
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		wgg := sync.WaitGroup{}
-		logger.Info("Starting connection pool simulation - dynamic size adjustment")
-
-		// 使用小连接池的初始请求
-		for i := 0; i < 3; i++ {
-			wgg.Add(1)
-			go func(iteration int) {
-				defer wgg.Done()
-				logger.Info("Request iteration %d with initial pool size", iteration)
-				performRequestResponse(pool, iteration)
-			}(i)
-		}
-
-		time.Sleep(2 * time.Second)
-
-		// 扩展连接池大小
-		logger.Info("Expanding connection pool from 5 to 8 connections")
-		pool.SetSize(8)
-
-		// 使用扩展后的连接池进行更多请求
-		for i := 3; i < 6; i++ {
-			wgg.Add(1)
-			go func(iteration int) {
-				defer wgg.Done()
-				logger.Info("Request iteration %d with expanded pool size", iteration)
-				performRequestResponse(pool, iteration)
-			}(i)
-		}
-
-		time.Sleep(2 * time.Second)
-
-		// 缩小连接池大小
-		logger.Info("Shrinking connection pool from 8 to 3 connections")
-		pool.SetSize(3)
-
-		// 使用缩减后的连接池进行最终请求
-		for i := 6; i < 10; i++ {
-			wgg.Add(1)
-			go func(iteration int) {
-				defer wgg.Done()
-				logger.Info("Request iteration %d with shrunk pool size", iteration)
-				performRequestResponse(pool, iteration)
-			}(i)
-		}
-		wgg.Wait()
+		testHealthCheck(pool)
 	}()
 
-	// 双向流式示例
+	// 测试2: 回显服务（请求-响应模式）
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		time.Sleep(1 * time.Second) // 先让一些请求完成
-		logger.Info("Starting bidirectional streaming example")
-		performBidirectionalStreaming(pool)
+		testEchoService(pool)
 	}()
 
-	// 多个并发流式会话
+	// 测试3: 时间流服务（流式处理）
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		wgg := sync.WaitGroup{}
-		time.Sleep(3 * time.Second)
-		logger.Info("Starting multiple concurrent streaming sessions")
-		for sessionID := 0; sessionID < 3; sessionID++ {
-			wgg.Add(1)
-			go func(sid int) {
-				defer wgg.Done()
-				logger.Info("Starting concurrent streaming session %d", sid)
-				performClientStreaming(pool, sid)
-			}(sessionID)
-		}
-		wgg.Wait()
+		testTimeStreaming(pool)
 	}()
 
+	// 等待所有测试完成
 	wg.Wait()
-	logger.Info("Complex client example completed")
+	logger.Info("All client tests completed successfully")
 }
 
-func performRequestResponse(pool *client.ClientPool, iteration int) {
-	route := fmt.Sprintf("/echo-%d", iteration%3)
-	payload := []byte(fmt.Sprintf("Hello from iteration %d at %s", iteration, time.Now().Format(time.RFC3339)))
+// testHealthCheck 测试健康检查功能
+func testHealthCheck(pool *client.ClientPool) {
+	logger.Info("=== Testing Health Check ===")
 
-	logger.Info("Sending request-response call to route %s, iteration %d", route, iteration)
+	// 发送健康检查请求
+	payload := []byte(`{"action":"check"}`)
+	response, err := pool.Call(RouteHealth, payload, 5*time.Second)
 
-	response, err := pool.Call(route, payload, 5*time.Second)
 	if err != nil {
-		logger.Error("Request failed for iteration %d: %v", iteration, err)
+		logger.Error("Health check failed: %v", err)
 		return
 	}
 
-	logger.Info("Received response for iteration %d: %s", iteration, string(response))
+	logger.Info("Health check response: %s", string(response))
 
-	// 模拟处理时间
-	time.Sleep(time.Duration(100+iteration*50) * time.Millisecond)
-}
-
-func performBidirectionalStreaming(pool *client.ClientPool) {
-	logger.Info("Starting bidirectional streaming session")
-
-	// 首先，建立服务器到客户端的流式传输
-	streamCh, err := pool.CallStream("/bidirectional", []byte("init"), 10*time.Second)
-	if err != nil {
-		logger.Error("Failed to establish bidirectional stream: %v", err)
-		return
-	}
-
-	// 处理传入的流数据
-	incomingDone := make(chan struct{})
-	go func() {
-		defer close(incomingDone)
-		for data := range streamCh {
-			logger.Info("Received server stream data: %s", string(data))
-		}
-		logger.Info("Server-to-client stream ended")
-	}()
-
-	// 发送多个客户端到服务器的流式请求
-	for i := 0; i < 5; i++ {
-		streamPayload := []byte(fmt.Sprintf("Client streaming message %d", i))
-		logger.Info("Sending client stream message %d", i)
-
-		// 为每个客户端流消息使用独立的连接
-		_, err := pool.Call("/client-stream", streamPayload, 3*time.Second)
+	// 模拟多次健康检查
+	for i := 0; i < 3; i++ {
+		response, err := pool.Call(RouteHealth, payload, 3*time.Second)
 		if err != nil {
-			logger.Error("Client stream message %d failed: %v", i, err)
-		} else {
-			logger.Info("Client stream message %d sent successfully", i)
+			logger.Error("Health check %d failed: %v", i+1, err)
+			continue
 		}
-
+		logger.Info("Health check %d: %s", i+1, string(response))
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 等待传入流完成
-	<-incomingDone
-	logger.Info("Bidirectional streaming session completed")
+	logger.Info("=== Health Check Test Completed ===")
 }
 
-func performClientStreaming(pool *client.ClientPool, sessionID int) {
-	logger.Info("Starting client streaming session %d", sessionID)
+// testEchoService 测试回显服务功能
+func testEchoService(pool *client.ClientPool) {
+	logger.Info("=== Testing Echo Service ===")
 
-	// 发送多个流式消息
-	for msgID := 0; msgID < 4; msgID++ {
-		payload := []byte(fmt.Sprintf("Session %d - Message %d - Timestamp: %d", sessionID, msgID, time.Now().UnixNano()))
-		route := fmt.Sprintf("/stream-session-%d", sessionID)
+	// 测试不同的回显消息
+	testMessages := []string{
+		"Hello, Server!",
+		"Testing echo service",
+		"Special characters: 你好世界 🌍",
+		"JSON data: {\"key\":\"value\",\"number\":42}",
+	}
 
-		logger.Info("Session %d sending message %d", sessionID, msgID)
+	for i, message := range testMessages {
+		payload := []byte(message)
+		response, err := pool.Call(RouteEcho, payload, 3*time.Second)
 
-		response, err := pool.Call(route, payload, 2*time.Second)
 		if err != nil {
-			logger.Error("Session %d message %d failed: %v", sessionID, msgID, err)
+			logger.Error("Echo test %d failed: %v", i+1, err)
 			continue
 		}
 
-		logger.Info("Session %d received response for message %d: %s", sessionID, msgID, string(response))
-
-		// 消息之间的变化延迟
-		time.Sleep(time.Duration(200+msgID*100) * time.Millisecond)
+		logger.Info("Echo %d - Sent: '%s', Received: '%s'", i+1, message, string(response))
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	logger.Info("Client streaming session %d completed", sessionID)
+	logger.Info("=== Echo Service Test Completed ===")
+}
+
+// testTimeStreaming 测试时间流服务功能
+func testTimeStreaming(pool *client.ClientPool) {
+	logger.Info("=== Testing Time Streaming Service ===")
+
+	// 发送流请求
+	payload := []byte(`{"action":"start_stream"}`)
+	streamChan, err := pool.CallStream(RouteStreamTime, payload, 15*time.Second)
+
+	if err != nil {
+		logger.Error("Failed to start time streaming: %v", err)
+		return
+	}
+
+	logger.Info("Time streaming started, waiting for messages...")
+
+	// 接收流式消息
+	messageCount := 0
+	startTime := time.Now()
+
+	for data := range streamChan {
+		messageCount++
+		logger.Info("Stream message %d: %s", messageCount, string(data))
+
+		// 显示接收进度
+		if messageCount%3 == 0 {
+			elapsed := time.Since(startTime)
+			logger.Info("Received %d messages in %.1f seconds", messageCount, elapsed.Seconds())
+		}
+	}
+
+	totalElapsed := time.Since(startTime)
+	logger.Info("=== Time Streaming Completed ===")
+	logger.Info("Total messages received: %d", messageCount)
+	logger.Info("Total duration: %.1f seconds", totalElapsed.Seconds())
+	logger.Info("Average message rate: %.1f messages/second", float64(messageCount)/totalElapsed.Seconds())
+}
+
+// testConcurrentRequests 测试并发请求（可选的高级测试）
+func testConcurrentRequests(pool *client.ClientPool) {
+	logger.Info("=== Testing Concurrent Requests ===")
+
+	var wg sync.WaitGroup
+	concurrency := 5
+	requestsPerWorker := 4
+
+	startTime := time.Now()
+
+	// 启动多个并发工作线程
+	for workerID := 0; workerID < concurrency; workerID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			logger.Debug("Worker %d started", id)
+
+			for reqID := 0; reqID < requestsPerWorker; reqID++ {
+				// 随机选择路由进行测试
+				var route string
+				var payload []byte
+
+				if reqID%2 == 0 {
+					route = RouteHealth
+					payload = []byte(fmt.Sprintf(`{"worker":%d,"request":%d}`, id, reqID))
+				} else {
+					route = RouteEcho
+					payload = []byte(fmt.Sprintf("Worker %d - Request %d", id, reqID))
+				}
+
+				response, err := pool.Call(route, payload, 2*time.Second)
+				if err != nil {
+					logger.Error("Worker %d request %d failed: %v", id, reqID, err)
+					continue
+				}
+
+				logger.Debug("Worker %d request %d: %s", id, reqID, string(response))
+
+				// 小延迟避免过载
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			logger.Debug("Worker %d completed", id)
+		}(workerID)
+	}
+
+	// 等待所有工作线程完成
+	wg.Wait()
+
+	totalElapsed := time.Since(startTime)
+	totalRequests := concurrency * requestsPerWorker
+
+	logger.Info("=== Concurrent Requests Test Completed ===")
+	logger.Info("Total requests: %d", totalRequests)
+	logger.Info("Total duration: %.2f seconds", totalElapsed.Seconds())
+	logger.Info("Average requests per second: %.1f", float64(totalRequests)/totalElapsed.Seconds())
 }

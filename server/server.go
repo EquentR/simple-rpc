@@ -4,12 +4,13 @@ package server
 
 import (
 	"crypto/tls"
+	"sync"
+	"time"
+
 	"github.com/EquentR/simple-rpc/conn"
 	"github.com/EquentR/simple-rpc/logger"
 	"github.com/EquentR/simple-rpc/protocol"
 	"github.com/EquentR/simple-rpc/rpc"
-	"sync"
-	"time"
 )
 
 // Mux 是路由多路复用器，管理路由到处理函数的映射
@@ -101,7 +102,7 @@ func (s *Server) Serve() error {
 
 	logger.Info("Server listening successfully, waiting for client connections")
 
-	// Accept connection loop
+	// 接受连接循环
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -111,11 +112,11 @@ func (s *Server) Serve() error {
 
 		logger.Info("Accepted new connection, remote address: %s", c.RemoteAddr())
 
-		// Wrap connection and store
+		// 包裹连接并存储
 		cn := conn.NewFrom(c)
 		s.conns.Store(cn, cn)
 
-		// Start processing goroutine
+		// 开始处理goroutine
 		go s.handleConn(cn)
 	}
 }
@@ -124,16 +125,16 @@ func (s *Server) Serve() error {
 func (s *Server) handleConn(cn *Conn) {
 	logger.Debug("Starting connection handling, remote address processing")
 
-	// Ensure resource cleanup when connection closes
+	// 确保连接关闭时资源清理
 	defer func() {
 		cn.Close()
 		s.conns.Delete(cn)
 		logger.Debug("Connection handling ended")
 	}()
 
-	// Request processing loop
+	// 请求处理循环
 	for {
-		// Read request frame
+		// 读取请求帧
 		f, err := cn.ReadOne()
 		if err != nil {
 			logger.Debug("Failed to read frame, connection may be closed: %v", err)
@@ -143,29 +144,40 @@ func (s *Server) handleConn(cn *Conn) {
 		logger.Debug("Received frame, ID: %d, flags: %d, type length: %d, data length: %d",
 			f.ID, f.Flags, len(f.Type), len(f.Value))
 
-		// Only process request frames
-		if f.Flags&protocol.FlagRequest == 0 {
-			logger.Warn("Received non-request frame, ignoring")
-			continue
+		// 处理不同类型的帧
+		if f.Flags&protocol.FlagRequest != 0 {
+			route := string(f.Type)
+			h := s.Mux.get(route)
+
+			ctx := rpc.NewContext(cn, f.ID, route, f.Value, h)
+
+			if h == nil {
+				logger.Warn("Route handler not found: %s", route)
+				_ = ctx.Reply([]byte{})
+				continue
+			}
+
+			// 提交到工作池进行处理
+			s.Pool.Submit(ctx)
+			logger.Debug("Request submitted to worker pool, route: %s", route)
+		} else if f.Flags&protocol.FlagStream != 0 && f.Flags&protocol.FlagResponse == 0 {
+			// 处理双向通信帧（设置流标志，但不设置响应标志）
+			route := string(f.Type)
+
+			ctx := rpc.NewContext(cn, f.ID, route, f.Value, nil)
+
+			// 尝试寻找双向通信的处理程序
+			h := s.Mux.get(route)
+			if h != nil {
+				ctx.H = h
+				ctx.HandleIncomingFrame(f)
+				s.Pool.Submit(ctx)
+			} else {
+				logger.Warn("No handler found for bidirectional route: %s", route)
+			}
+		} else {
+			logger.Warn("Received frame with unexpected flags, ID: %d, flags: %d", f.ID, f.Flags)
 		}
-
-		// Parse route
-		route := string(f.Type)
-		h := s.Mux.get(route)
-
-		// Create processing context
-		ctx := rpc.NewContext(cn, f.ID, route, f.Value, h)
-
-		// If no handler found, return empty response
-		if h == nil {
-			logger.Warn("Route handler not found: %s", route)
-			_ = ctx.Reply([]byte{})
-			continue
-		}
-
-		// Submit to worker pool for processing
-		s.Pool.Submit(ctx)
-		logger.Debug("Request submitted to worker pool, route: %s", route)
 	}
 }
 

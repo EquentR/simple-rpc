@@ -13,6 +13,14 @@ import (
 	"github.com/EquentR/simple-rpc/protocol"
 )
 
+// BidirectionalSession 表示一个双向通信会话
+type BidirectionalSession struct {
+	conn     *Conn                // 关联的连接
+	route    string               // 路由
+	handler  func([]byte)         // 消息处理器
+	incoming chan *protocol.Frame // 消息通道
+}
+
 // ClientPool 管理连接池中的多个TCP连接
 type ClientPool struct {
 	Addr        string        // 服务器地址
@@ -46,6 +54,11 @@ type Conn struct {
 	refCount atomic.Int32 // 引用计数
 	lastUsed atomic.Int64 // 最后使用时间戳
 	inUse    atomic.Bool  // 是否正在使用
+
+	// 双向通信支持
+	incoming      chan *protocol.Frame // 服务器主动推送的消息通道
+	handlers      sync.Map             // 路由处理器映射
+	bidirectional atomic.Bool          // 是否启用双向通信模式
 }
 
 // New 创建新的客户端连接池
@@ -85,7 +98,7 @@ func (cc *Conn) ensure() error {
 		cc.cn.Close()
 	}
 
-	logger.Info("Connection ID: %d starting TCP connection establishment, address: %s", cc.id, cc.addr)
+	logger.Debug("Connection ID: %d starting TCP connection establishment, address: %s", cc.id, cc.addr)
 	d := &net.Dialer{Timeout: cc.p.DialTimeout}
 	c, err := tls.DialWithDialer(d, "tcp", cc.addr, cc.cfg)
 	if err != nil {
@@ -95,7 +108,7 @@ func (cc *Conn) ensure() error {
 
 	cc.cn = conn.NewFrom(c)
 	cc.dead.Store(false)
-	logger.Info("Connection ID: %d TCP connection established successfully", cc.id)
+	logger.Debug("Connection ID: %d TCP connection established successfully", cc.id)
 
 	// 启动读取goroutine
 	go cc.read()
@@ -116,8 +129,24 @@ func (cc *Conn) read() {
 			return
 		}
 
-		logger.Debug("Connection ID: %d received data frame, ID: %d, type: %s", cc.id, f.ID, string(f.Type))
+		logger.Debug("Connection ID: %d received data frame, ID: %d, type: %s, flags: %d", cc.id, f.ID, string(f.Type), f.Flags)
 
+		// 处理服务器主动推送的消息（FlagStream 设置但 FlagResponse 未设置）
+		if f.Flags&protocol.FlagStream != 0 && f.Flags&protocol.FlagRequest == 0 && f.Flags&protocol.FlagResponse == 0 {
+			logger.Debug("Connection ID: %d received server-initiated message, route: %s", cc.id, string(f.Type))
+			cc.handleServerPush(f)
+			continue
+		}
+
+		// 处理高bit ID的双向消息响应（服务器可能仍然发送响应）
+		if f.ID&0x8000000000000000 != 0 {
+			logger.Debug("Connection ID: %d received response for bidirectional message, route: %s", cc.id, string(f.Type))
+			// 尝试通过消息处理器处理，如果没有处理器则忽略
+			cc.handleServerPush(f)
+			continue
+		}
+
+		// 处理正常的响应消息
 		chv, ok := cc.resp.Load(f.ID)
 		if !ok {
 			logger.Warn("Connection ID: %d no channel found for request ID: %d", cc.id, f.ID)
@@ -156,6 +185,91 @@ func (cc *Conn) write(f *protocol.Frame) error {
 		logger.Debug("Connection ID: %d successfully sent data frame, request ID: %d", cc.id, f.ID)
 	}
 	return err
+}
+
+// handleServerPush 处理服务器主动推送的消息
+func (cc *Conn) handleServerPush(f *protocol.Frame) {
+	route := string(f.Type)
+	logger.Debug("Connection ID: %d handling server push for route: %s", cc.id, route)
+
+	// 检查是否有注册的处理函数
+	if handler, ok := cc.handlers.Load(route); ok && handler != nil {
+		handlerFunc := handler.(func([]byte))
+		logger.Debug("Connection ID: %d executing handler for route: %s", cc.id, route)
+		go handlerFunc(f.Value) // 在goroutine中执行，避免阻塞读取循环
+	} else if cc.incoming != nil {
+		// 如果有incoming通道，将消息发送到通道
+		select {
+		case cc.incoming <- f:
+			logger.Debug("Connection ID: %d pushed message to incoming channel for route: %s", cc.id, route)
+		default:
+			logger.Warn("Connection ID: %d incoming channel full, dropping message for route: %s", cc.id, route)
+		}
+	} else {
+		logger.Warn("Connection ID: %d no handler or incoming channel for server push route: %s", cc.id, route)
+	}
+}
+
+// EnableBidirectional 启用双向通信模式
+func (cc *Conn) EnableBidirectional() {
+	if cc.bidirectional.CompareAndSwap(false, true) {
+		cc.incoming = make(chan *protocol.Frame, 100)
+		logger.Info("Connection ID: %d bidirectional communication enabled", cc.id)
+	}
+}
+
+// OnMessage 注册消息处理器（类似WebSocket的onmessage）
+func (cc *Conn) OnMessage(route string, handler func([]byte)) {
+	if handler != nil {
+		cc.handlers.Store(route, handler)
+		logger.Debug("Connection ID: %d registered handler for route: %s", cc.id, route)
+	}
+	logger.Debug("Connection ID: %d handler for route: %s is nil, skip register", cc.id, route)
+}
+
+// SendMessage 主动向服务器发送消息（无需请求-响应模式）
+func (cc *Conn) SendMessage(route string, data []byte) error {
+	if cc.IsDead() {
+		return errors.New("connection is dead")
+	}
+
+	// 生成消息ID（使用高bit标记为双向通信消息）
+	id := cc.p.rid.Add(1) | 0x8000000000000000
+
+	// 构建双向通信帧（FlagStream设置，但非请求也非响应）
+	f := &protocol.Frame{
+		Flags: protocol.FlagStream,
+		ID:    id,
+		Type:  []byte(route),
+		Value: data,
+	}
+
+	logger.Debug("Connection ID: %d sending bidirectional message, route: %s, length: %d", cc.id, route, len(data))
+	return cc.write(f)
+}
+
+// ReceiveMessage 接收服务器推送的消息（非阻塞）
+func (cc *Conn) ReceiveMessage() (*protocol.Frame, bool) {
+	if cc.incoming == nil {
+		return nil, false
+	}
+
+	select {
+	case f := <-cc.incoming:
+		return f, true
+	default:
+		return nil, false
+	}
+}
+
+// ReceiveMessageBlocking 接收服务器推送的消息（阻塞）
+func (cc *Conn) ReceiveMessageBlocking() (*protocol.Frame, error) {
+	if cc.incoming == nil {
+		return nil, errors.New("bidirectional communication not enabled")
+	}
+
+	f := <-cc.incoming
+	return f, nil
 }
 
 func (cc *Conn) IsDead() bool {
@@ -244,7 +358,7 @@ func (p *ClientPool) next() *Conn {
 
 	// 检查连接是否有效
 	if cc == nil || cc.dead.Load() || (cc.cn != nil && cc.cn.Closed()) {
-		logger.Info("Connection ID: %d invalid, preparing to recreate", cc.id)
+		logger.Debug("Connection ID: %d invalid, preparing to recreate", cc.id)
 
 		// 获取写锁以重新创建连接
 		p.mu.Lock()
@@ -252,7 +366,7 @@ func (p *ClientPool) next() *Conn {
 		if i < len(p.conns) && (p.conns[i] == nil || p.conns[i].dead.Load() || (p.conns[i].cn != nil && p.conns[i].cn.Closed())) {
 			connID := p.connIDGen.Add(1)
 			p.conns[i] = &Conn{id: connID, addr: p.Addr, cfg: p.TLSConfig, p: p}
-			logger.Info("Connection pool index %d recreating connection, new connection ID: %d", i, connID)
+			logger.Debug("Connection pool index %d recreating connection, new connection ID: %d", i, connID)
 		}
 		cc = p.conns[i]
 		p.mu.Unlock()
@@ -275,7 +389,7 @@ func (cc *Conn) GetConnID() uint64 {
 
 // Call 进行同步远程服务调用
 func (p *ClientPool) Call(route string, payload []byte, timeout time.Duration) ([]byte, error) {
-	logger.Info("Starting synchronous call, route: %s, timeout: %v", route, timeout)
+	logger.Debug("Starting synchronous call, route: %s, timeout: %v", route, timeout)
 
 	// 生成请求ID
 	id := p.rid.Add(1)
@@ -322,7 +436,7 @@ func (p *ClientPool) Call(route string, payload []byte, timeout time.Duration) (
 			logger.Error("Server returned error: %s", errMsg)
 			return nil, errors.New(errMsg)
 		}
-		logger.Info("Synchronous call successful, route: %s", route)
+		logger.Debug("Synchronous call successful, route: %s", route)
 		return rf.Value, nil
 	case <-t.C:
 		logger.Error("Request timeout, request ID: %d", id)
@@ -333,7 +447,7 @@ func (p *ClientPool) Call(route string, payload []byte, timeout time.Duration) (
 
 // CallStream 进行流式远程服务调用，返回数据通道
 func (p *ClientPool) CallStream(route string, payload []byte, timeout time.Duration) (<-chan []byte, error) {
-	logger.Info("Starting streaming call, route: %s, timeout: %v", route, timeout)
+	logger.Debug("Starting streaming call, route: %s, timeout: %v", route, timeout)
 
 	// 生成请求ID
 	id := p.rid.Add(1)
@@ -391,7 +505,7 @@ func (p *ClientPool) CallStream(route string, payload []byte, timeout time.Durat
 				out <- rf.Value
 				// 检查流式响应是否结束
 				if rf.Flags&protocol.FlagStream == 0 || rf.Flags&protocol.FlagStreamEnd != 0 {
-					logger.Info("Streaming call response ended, request ID: %d", id)
+					logger.Debug("Streaming call response ended, request ID: %d", id)
 					return
 				}
 			case <-t.C:
@@ -401,7 +515,7 @@ func (p *ClientPool) CallStream(route string, payload []byte, timeout time.Durat
 		}
 	}()
 
-	logger.Info("Streaming call started successfully, route: %s", route)
+	logger.Debug("Streaming call started successfully, route: %s", route)
 	return out, nil
 }
 
@@ -561,4 +675,129 @@ func (p *ClientPool) SetCleanupInterval(interval time.Duration) {
 	}
 	p.cleanupInterval = interval
 	logger.Info("Cleanup interval updated: %v", interval)
+}
+
+// EnableBidirectional 为连接池启用双向通信模式
+func (p *ClientPool) EnableBidirectional() {
+	logger.Info("Enabling bidirectional communication for connection pool")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, cc := range p.conns {
+		if cc != nil {
+			cc.EnableBidirectional()
+		}
+	}
+}
+
+// OnMessage 注册全局消息处理器（对所有连接生效）
+func (p *ClientPool) OnMessage(route string, handler func([]byte)) {
+	logger.Info("Registering global message handler for route: %s", route)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, cc := range p.conns {
+		if cc != nil && handler != nil {
+			cc.OnMessage(route, handler)
+		}
+	}
+}
+
+// SendMessage 向服务器发送双向消息（使用第一个可用连接）
+func (p *ClientPool) SendMessage(route string, data []byte) error {
+	cc := p.next()
+	if cc == nil {
+		return errors.New("no available connection")
+	}
+	defer cc.release()
+
+	return cc.SendMessage(route, data)
+}
+
+// ReceiveMessage 接收服务器推送的消息（非阻塞，使用轮询连接）
+func (p *ClientPool) ReceiveMessage() (*protocol.Frame, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 轮询所有连接，查找有消息的连接
+	for _, cc := range p.conns {
+		if cc != nil && !cc.IsDead() && cc.bidirectional.Load() {
+			if f, ok := cc.ReceiveMessage(); ok {
+				return f, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// ReceiveMessageBlocking 接收服务器推送的消息（阻塞，使用第一个双向连接）
+func (p *ClientPool) ReceiveMessageBlocking() (*protocol.Frame, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 找到第一个启用了双向通信的连接
+	for _, cc := range p.conns {
+		if cc != nil && !cc.IsDead() && cc.bidirectional.Load() {
+			return cc.ReceiveMessageBlocking()
+		}
+	}
+	return nil, errors.New("no bidirectional connection available")
+}
+
+// CreateBidirectionalSession 创建专用的双向通信会话
+func (p *ClientPool) CreateBidirectionalSession(route string, handler func([]byte)) (*BidirectionalSession, error) {
+	cc := p.next()
+	if cc == nil {
+		return nil, errors.New("no available connection")
+	}
+
+	// 启用双向通信
+	cc.EnableBidirectional()
+
+	// 注册路由处理器
+	if handler != nil {
+		cc.OnMessage(route, handler)
+	}
+
+	session := &BidirectionalSession{
+		conn:    cc,
+		route:   route,
+		handler: handler,
+	}
+	if cc.incoming != nil {
+		session.incoming = cc.incoming
+	} else {
+		session.incoming = make(chan *protocol.Frame, 100)
+		cc.incoming = session.incoming
+	}
+
+	logger.Info("Created bidirectional session for route: %s, connection ID: %d", route, cc.id)
+	return session, nil
+}
+
+// Send 发送消息到服务器
+func (s *BidirectionalSession) Send(data []byte) error {
+	return s.conn.SendMessage(s.route, data)
+}
+
+// Receive 接收消息（非阻塞）
+func (s *BidirectionalSession) Receive() ([]byte, bool) {
+	select {
+	case f := <-s.incoming:
+		return f.Value, true
+	default:
+		return nil, false
+	}
+}
+
+// ReceiveBlocking 接收消息（阻塞）
+func (s *BidirectionalSession) ReceiveBlocking() ([]byte, error) {
+	f := <-s.incoming
+	return f.Value, nil
+}
+
+// Close 关闭会话
+func (s *BidirectionalSession) Close() {
+	close(s.incoming)
+	logger.Info("Closed bidirectional session for route: %s", s.route)
 }
